@@ -1,0 +1,170 @@
+import os, sys, subprocess
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+from pathlib import Path
+import numpy as np
+import cv2
+from PIL import Image
+import streamlit as st
+
+
+st.set_page_config(page_title=" App Dự Đoán Kí tự Siêu Vipp", page_icon="✦", layout="wide")
+
+st.markdown("""
+<style>
+html, body, [class*="css"] { background-color: #0d1117; color: #e6edf3; }
+.big-letter {
+    font-size: 5rem; font-weight: 800; color: #e8445a;
+    background: #1c2333; border-radius: 8px;
+    text-align: center; padding: 10px;
+}
+.conf-box {
+    font-size: 1.8rem; font-weight: 700; color: #3fb950;
+    background: #1c2333; border-radius: 8px;
+    text-align: center; padding: 20px 10px;
+}
+.divider { height: 2px; background: #e8445a; border: none; margin-bottom: 20px; }
+.sec-label { font-size: 0.78rem; font-weight: 700; color: #8b949e; letter-spacing: 1px; }
+.top5-row {
+    display: flex; align-items: center; padding: 6px 10px;
+    margin-bottom: 4px; border-radius: 6px; background: #1c2333;
+}
+.top5-bar-wrap { flex:1; margin:0 10px; height:8px; background:#21262d; border-radius:4px; overflow:hidden; }
+.top5-bar { height:8px; background:#e8445a; border-radius:4px; }
+.top5-pct { color:#3fb950; font-size:0.9rem; font-weight:600; min-width:52px; text-align:right; }
+</style>
+""", unsafe_allow_html=True)
+
+MODEL_PATH = Path(__file__).parent / "model.keras"
+LABELS     = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+def fix_image(img_flat):
+    img = img_flat.reshape(28, 28)
+    img = np.rot90(img, k=3)
+    img = np.fliplr(img)
+    return img.reshape(784)
+
+def train_and_save():
+    import pandas as pd, kagglehub
+    from keras.models import Sequential
+    from keras.layers import Dense, Dropout, BatchNormalization
+    from keras.utils import to_categorical
+    from keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+    with st.spinner("⏳ Đang tải dataset EMNIST (lần đầu ~vài phút)..."):
+        path = kagglehub.dataset_download("crawford/emnist")
+    with st.spinner("⏳ Đang đọc CSV..."):
+        tr = pd.read_csv(f"{path}/emnist-letters-train.csv", header=None)
+        te = pd.read_csv(f"{path}/emnist-letters-test.csv",  header=None)
+        x_tr = np.array([fix_image(r) for r in tr.iloc[:,1:].values]).astype("float32")/255
+        x_te = np.array([fix_image(r) for r in te.iloc[:,1:].values]).astype("float32")/255
+        y_tr = to_categorical(tr.iloc[:,0].values-1, 26)
+        y_te = to_categorical(te.iloc[:,0].values-1, 26)
+    with st.spinner("🚀 Đang train model..."):
+        m = Sequential([
+            Dense(1024, activation="relu", input_shape=(784,)),
+            BatchNormalization(), Dropout(0.3),
+            Dense(512,  activation="relu"), BatchNormalization(), Dropout(0.3),
+            Dense(256,  activation="relu"), BatchNormalization(), Dropout(0.3),
+            Dense(128,  activation="relu"), Dropout(0.2),
+            Dense(26,   activation="softmax"),
+        ])
+        m.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+        m.fit(x_tr, y_tr, epochs=20, batch_size=128, validation_split=0.1,
+              callbacks=[EarlyStopping(patience=3, restore_best_weights=True),
+                         ReduceLROnPlateau(factor=0.5, patience=2)], verbose=0)
+        _, acc = m.evaluate(x_te, y_te, verbose=0)
+        m.save(MODEL_PATH)
+    st.success(f"✅ Đã lưu model — Accuracy: {acc*100:.2f}%")
+    return m
+
+@st.cache_resource
+def load_or_train():
+    from keras.models import load_model
+    if MODEL_PATH.exists():
+        return load_model(MODEL_PATH)
+    return train_and_save()
+
+model = load_or_train()
+
+def predict_array(arr: np.ndarray):
+    resized  = cv2.resize(arr, (28, 28))
+    inverted = cv2.bitwise_not(resized)
+    inp      = inverted.reshape(1, 784).astype("float32") / 255.0
+    preds    = model.predict(inp, verbose=0)[0]
+    top5     = [(LABELS[i], float(preds[i])*100) for i in np.argsort(preds)[::-1][:5]]
+    return top5
+
+st.markdown("## ✦ App Dự Đoán Kí tự Siêu Vipp")
+st.markdown('<p style="color:#8b949e">Vẽ chữ cái · hoặc tải ảnh lên · rồi bấm Nhận dạng</p>', unsafe_allow_html=True)
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+col_left, col_right = st.columns([1.1, 0.9], gap="large")
+
+arr = None
+
+with col_left:
+    st.markdown('<div class="sec-label">✏ VẼ CHỮ CÁI HOẶC TẢI ẢNH</div>', unsafe_allow_html=True)
+    tab_draw, tab_upload = st.tabs(["🖊 Vẽ tay", "📂 Tải ảnh"])
+
+    with tab_draw:
+        try:
+            from streamlit_drawable_canvas import st_canvas
+            canvas_result = st_canvas(
+                fill_color="rgba(0,0,0,0)",
+                stroke_width=18,
+                stroke_color="#000000",
+                background_color="#ffffff",
+                height=320, width=320,
+                drawing_mode="freedraw",
+                key="canvas",
+            )
+            if canvas_result.image_data is not None:
+                img_data = canvas_result.image_data.astype(np.uint8)
+                gray = cv2.cvtColor(img_data, cv2.COLOR_RGBA2GRAY)
+                if not np.all(gray == 255):
+                    arr = gray
+        except ImportError:
+            st.error("Thiếu thư viện! Chạy: pip install streamlit-drawable-canvas")
+
+    with tab_upload:
+        uploaded = st.file_uploader("Chọn ảnh PNG/JPG/BMP", type=["png","jpg","jpeg","bmp"])
+        if uploaded:
+            file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
+            img_cv = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+            if img_cv is not None:
+                arr = img_cv
+                st.image(uploaded, caption="Ảnh đã tải lên", width=320)
+
+    st.markdown("")
+    btn = st.button("▶  Nhận dạng", use_container_width=True, type="primary")
+
+with col_right:
+    st.markdown('<div class="sec-label">◈ KẾT QUẢ</div>', unsafe_allow_html=True)
+    ph_letter = st.empty()
+    ph_conf   = st.empty()
+    st.markdown('<div class="sec-label" style="margin-top:16px">📊 TOP 5 DỰ ĐOÁN</div>', unsafe_allow_html=True)
+    ph_top5   = st.empty()
+
+    def show_default():
+        ph_letter.markdown('<div class="big-letter">?</div>', unsafe_allow_html=True)
+        ph_conf.markdown('<div class="conf-box">— %</div>', unsafe_allow_html=True)
+        rows = "".join([f'<div class="top5-row"><span style="color:#8b949e;width:20px">{i}.</span><span style="color:#e8445a;font-weight:700;margin:0 10px;width:24px">—</span><div class="top5-bar-wrap"><div class="top5-bar" style="width:0%"></div></div><span class="top5-pct">— %</span></div>' for i in range(1,6)])
+        ph_top5.markdown(rows, unsafe_allow_html=True)
+
+    def show_result(top5):
+        letter, conf = top5[0]
+        ph_letter.markdown(f'<div class="big-letter">{letter}</div>', unsafe_allow_html=True)
+        ph_conf.markdown(f'<div class="conf-box">{conf:.1f} %</div>', unsafe_allow_html=True)
+        rows = "".join([f'<div class="top5-row"><span style="color:#8b949e;width:20px">{i+1}.</span><span style="color:#e8445a;font-weight:700;margin:0 10px;width:24px">{l}</span><div class="top5-bar-wrap"><div class="top5-bar" style="width:{c:.1f}%"></div></div><span class="top5-pct">{c:.1f}%</span></div>' for i,(l,c) in enumerate(top5)])
+        ph_top5.markdown(rows, unsafe_allow_html=True)
+
+    show_default()
+
+    if btn:
+        if arr is None:
+            st.warning("⚠ Hãy vẽ chữ cái hoặc tải ảnh trước!")
+        else:
+            with st.spinner("🔍 Đang phân tích..."):
+                top5 = predict_array(arr)
+            show_result(top5)
